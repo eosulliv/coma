@@ -1,7 +1,6 @@
 import math
 import heapq
 import numpy as np
-import os
 import scipy.sparse as sp
 from psbody.mesh import Mesh
 #from psbody.mesh.topology.decimation import vertex_quadrics

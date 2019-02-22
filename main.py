@@ -1,14 +1,18 @@
 from __future__ import print_function
+
+from facemesh import FaceData
 from lib import models, graph, coarsening, utils, mesh_sampling
 from lib.visualize_latent_space import visualize_latent_space
-import numpy as np
+from opendr.topology import get_vert_connectivity
+
+import argparse
+import copy
 import json
 import os
-import copy
-import argparse
-from facemesh import FaceData
-from opendr.topology import get_vert_connectivity
 import time
+
+import numpy as np
+
 
 parser = argparse.ArgumentParser(description='Tensorflow Trainer for Convolutional Mesh Autoencoders')
 parser.add_argument('--name', default='bareteeth', help='facial_motion| lfw ')
@@ -75,8 +79,8 @@ params['unpool']		 = 'poolwT'
 params['F_0']            = int(X_train.shape[2])  # Number of graph input features.
 params['F']              = [16, 16, 16, 32]  # Number of graph convolutional filters.
 params['K']              = [6, 6, 6, 6]  # Polynomial orders.
-params['p']              = p #[4, 4, 4, 4]    # Pooling sizes.
-params['nz']              = [nz]  # Output dimensionality of fully connected layers.
+params['p']              = p  # [4, 4, 4, 4]    # Pooling sizes.
+params['nz']             = [nz]  # Output dimensionality of fully connected layers.
 
 # Optimization.
 params['which_loss']     = args.loss
@@ -105,15 +109,15 @@ if args.mode in ['test']:
             facedata.show_mesh(viewer=viewer_recon, mesh_vecs=predictions_unperm[i*20:(i+1)*20], figsize=(5,4))
             time.sleep(0.1)
 elif args.mode in ['sample']:
-	meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
-	features = model.encode(meshes)
+    meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
+    features = model.encode(meshes)
 elif args.mode in ['latent']:
     visualize_latent_space(model, facedata)
 else:
-	if not os.path.exists(os.path.join('checkpoints', args.name)):
-	    os.makedirs(os.path.join('checkpoints', args.name))
-	with open(os.path.join('checkpoints', args.name +'params.json'),'w') as fp:
-		saveparams = copy.deepcopy(params)
-		saveparams['seed'] = args.seed
-		json.dump(saveparams, fp)
-	loss, t_step = model.fit(X_train, X_train, X_val, X_val)
+    if not os.path.exists(os.path.join('checkpoints', args.name)):
+        os.makedirs(os.path.join('checkpoints', args.name))
+    with open(os.path.join('checkpoints', args.name +'params.json'),'w') as fp:
+        saveparams = copy.deepcopy(params)
+        saveparams['seed'] = args.seed
+        json.dump(saveparams, fp)
+        loss, t_step = model.fit(X_train, X_train, X_val, X_val)
