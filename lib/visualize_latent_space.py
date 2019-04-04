@@ -10,7 +10,8 @@ def visualize_latent_space(model, facedata, mesh_path=None):
 
     latent_vector = model.encode(normalized_mesh)
     viewer = MeshViewers(window_width=800, window_height=800, shape=[1, 1], titlebar='Meshes')
-
+    recon_vec = model.decode(latent_vector)
+    facedata.show_mesh(viewer=viewer, mesh_vecs=recon_vec, figsize=(1, 1))
 
     while(1):
         input_key = readchar.readchar()

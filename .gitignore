@@ -1,7 +1,10 @@
 .idea/*
+checkpoints/*_testparams.json
 results/*
 summaries/*
+opendr/*
 logger.txt
 *.pyc
 *.npy
-
+*.ipynb
+.ipynb_checkpoints/*

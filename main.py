@@ -1,9 +1,9 @@
 from __future__ import print_function
 
 from facemesh import FaceData
-from lib import models, graph, coarsening, utils, mesh_sampling
-from lib.visualize_latent_space import visualize_latent_space
-from opendr.topology import get_vert_connectivity
+from lib import graph, mesh_sampling, models
+# from lib.visualize_latent_space import visualize_latent_space
+# from opendr.topology import get_vert_connectivity
 
 import argparse
 import copy
@@ -19,7 +19,7 @@ parser.add_argument('--name', default='bareteeth', help='facial_motion| lfw ')
 parser.add_argument('--data', default='data/bareteeth', help='facial_motion| lfw ')
 parser.add_argument('--batch_size', type=int, default=16, help='input batch size for training (default: 64)')
 parser.add_argument('--num_epochs', type=int, default=200, help='number of epochs to train (default: 2)')
-parser.add_argument('--eval_frequency', type=int, default=200, help='eval frequency')
+parser.add_argument('--eval_frequency', type=int, default=50, help='eval frequency')
 parser.add_argument('--filter', default='chebyshev5', help='filter')
 parser.add_argument('--nz', type=int, default=8, help='Size of latent variable')
 parser.add_argument('--lr', type=float, default=8e-3, help='Learning Rate')
@@ -37,23 +37,27 @@ args = parser.parse_args()
 
 np.random.seed(args.seed)
 nz = args.nz
-print("Loading data .. ")
+print("Loading data...")
 reference_mesh_file = 'data/template.obj'
-facedata = FaceData(nVal=100, train_file=args.data+'/train.npy',
-    test_file=args.data+'/test.npy', reference_mesh_file=reference_mesh_file, pca_n_comp=nz)
-
-ds_factors = [4,4,4,4]	# Sampling factor of the mesh at each stage of sampling
-print("Generating Transform Matrices ..")
+facedata = FaceData(nVal=100, train_file=args.data+'/train.npy', test_file=args.data+'/test.npy',
+                    reference_mesh_file=reference_mesh_file, pca_n_comp=nz)
 
 # Generates adjecency matrices A, downsampling matrices D, and upsamling matrices U by sampling
 # the mesh 4 times. Each time the mesh is sampled by a factor of 4
+ds_factors = [4, 4, 4, 4]  # Sampling factor of the mesh at each stage of sampling
 
-M,A,D,U = mesh_sampling.generate_transform_matrices(facedata.reference_mesh, ds_factors)
+if not os.path.exists(args.data+'/MADU.npy'):  # MADU matrices do not already exists
+    print('MADU matrices do not already exist. Generating Transform Matrices ..')
+    M, A, D, U = mesh_sampling.generate_transform_matrices(facedata.reference_mesh, ds_factors)
+    np.save(args.data+'/MADU', [M, A, D, U])
+else:
+    print('MADU matrices previously created. Loading...')
+    M, A, D, U = np.load(args.data+'/MADU.npy')
 
-A = map(lambda x:x.astype('float32'), A)
-D = map(lambda x:x.astype('float32'), D)
-U = map(lambda x:x.astype('float32'), U)
-p = map(lambda x:x.shape[0], A)
+A = list(map(lambda x: x.astype('float32'), A))
+D = list(map(lambda x: x.astype('float32'), D))
+U = list(map(lambda x: x.astype('float32'), U))
+p = list(map(lambda x: x.shape[0], A))
 
 X_train = facedata.vertices_train.astype('float32')
 X_val = facedata.vertices_val.astype('float32')
@@ -94,30 +98,36 @@ params['decay_steps']    = n_train / params['batch_size']
 
 model = models.coma(L=L, D=D, U=U, **params)
 
-if args.mode in ['test']:
-    if not os.path.exists('results'):
-        os.makedirs('results')
-    predictions, loss = model.predict(X_test, X_test)
-    print("L1 Loss= ", loss)
-    euclidean_loss = np.mean(np.sqrt(np.sum((facedata.std*(predictions-facedata.vertices_test))**2, axis=2)))
-    print("Euclidean loss= ", euclidean_loss)
-    np.save('results/'+args.name+'_predictions', predictions)
-    if args.viz:
-        from psbody.mesh import MeshViewers
-        viewer_recon = MeshViewers(window_width=800, window_height=1000, shape=[5, 4], titlebar='Mesh Reconstructions')
-        for i in range(predictions.shape[0]/20):
-            facedata.show_mesh(viewer=viewer_recon, mesh_vecs=predictions_unperm[i*20:(i+1)*20], figsize=(5,4))
-            time.sleep(0.1)
-elif args.mode in ['sample']:
-    meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
-    features = model.encode(meshes)
-elif args.mode in ['latent']:
-    visualize_latent_space(model, facedata)
-else:
-    if not os.path.exists(os.path.join('checkpoints', args.name)):
-        os.makedirs(os.path.join('checkpoints', args.name))
-    with open(os.path.join('checkpoints', args.name +'params.json'),'w') as fp:
-        saveparams = copy.deepcopy(params)
-        saveparams['seed'] = args.seed
-        json.dump(saveparams, fp)
-        loss, t_step = model.fit(X_train, X_train, X_val, X_val)
+# if args.mode in ['test']:
+#     print('Starting testing...')
+#     if not os.path.exists('results'):
+#         os.makedirs('results')
+#     predictions, loss = model.predict(X_test, X_test)
+#     print("L1 Loss= ", loss)
+#     euclidean_loss = np.mean(np.sqrt(np.sum((facedata.std*(predictions-facedata.vertices_test))**2, axis=2)))
+#     print("Euclidean loss= ", euclidean_loss)
+#     np.save('results/'+args.name+'_predictions', predictions)
+#
+#     # if args.viz:
+#     #     from psbody.mesh import MeshViewers
+#     #     viewer_recon = MeshViewers(window_width=800, window_height=1000, shape=[5,4], titlebar='Mesh Reconstructions')
+#     #     for i in range(predictions.shape[0]/20):
+#     #         facedata.show_mesh(viewer=viewer_recon, mesh_vecs=predictions_unperm[i*20:(i+1)*20], figsize=(5,4))
+#     #         time.sleep(0.1)
+#
+# elif args.mode in ['sample']:
+#     print('Sampling meshes...')
+#     meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
+#     features = model.encode(meshes)
+# elif args.mode in ['latent']:
+#     print('Latent mode visualisation temporarily deactivated.')
+#     # visualize_latent_space(model, facedata)
+# else:
+#     print('Starting training...')
+#     if not os.path.exists(os.path.join('checkpoints', args.name)):
+#         os.makedirs(os.path.join('checkpoints', args.name))
+#     with open(os.path.join('checkpoints', args.name + 'params.json'), 'w') as fp:
+#         saveparams = copy.deepcopy(params)
+#         saveparams['seed'] = args.seed
+#         json.dump(saveparams, fp)
+#         loss, t_step = model.fit(X_train, X_train, X_val, X_val)

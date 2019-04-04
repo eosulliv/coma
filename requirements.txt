@@ -1,11 +1,15 @@
-numpy
-scipy
-scikit-learn
-matplotlib
-tqdm
-# gensim
-tensorflow-gpu
-jupyter
 ipython
-# opendr
+jupyter
+matplotlib
+menpo
+menpo3d
+numpy
 readchar
+scikit-learn
+scipy
+tensorflow
+tensorflow-gpu
+tqdm
+
+# gensim
+# opendr

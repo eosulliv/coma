@@ -2,9 +2,13 @@ import math
 import heapq
 import numpy as np
 import scipy.sparse as sp
-from psbody.mesh import Mesh
-#from psbody.mesh.topology.decimation import vertex_quadrics
+
 from opendr.topology import get_vert_connectivity, get_vertices_per_edge
+
+from menpo.shape import PointCloud, TriMesh
+from menpo3d.vtkutils import trimesh_from_vtk, trimesh_to_vtk, VTKClosestPointLocator
+
+from vtk.util.numpy_support import vtk_to_numpy
 
 
 def vertex_quadrics(mesh):
@@ -15,14 +19,13 @@ def vertex_quadrics(mesh):
     """
 
     # Allocate quadrics
-    v_quadrics = np.zeros((len(mesh.v), 4, 4,))
+    v_quadrics = np.zeros((len(mesh.points), 4, 4,))
 
     # For each face...
-    for f_idx in range(len(mesh.f)):
-
+    for f_idx in range(len(mesh.trilist)):
         # Compute normalized plane equation for that face
-        vert_idxs = mesh.f[f_idx]
-        verts = np.hstack((mesh.v[vert_idxs], np.array([1, 1, 1]).reshape(-1, 1)))
+        vert_idxs = mesh.trilist[f_idx]
+        verts = np.hstack((mesh.points[vert_idxs], np.array([1, 1, 1]).reshape(-1, 1)))
         u, s, v = np.linalg.svd(verts)
         eq = v[-1, :].reshape(-1, 1)
         eq = eq / (np.linalg.norm(eq[0:3]))
@@ -30,31 +33,49 @@ def vertex_quadrics(mesh):
         # Add the outer product of the plane equation to the
         # quadrics of the vertices for this face
         for k in range(3):
-            v_quadrics[mesh.f[f_idx, k], :, :] += np.outer(eq, eq)
+            v_quadrics[mesh.trilist[f_idx, k], :, :] += np.outer(eq, eq)
 
     return v_quadrics
 
-def setup_deformation_transfer(source, target, use_normals=False):
-    rows = np.zeros(3 * target.v.shape[0])
-    cols = np.zeros(3 * target.v.shape[0])
-    coeffs_v = np.zeros(3 * target.v.shape[0])
-    coeffs_n = np.zeros(3 * target.v.shape[0])
 
-    nearest_faces, nearest_parts, nearest_vertices = source.compute_aabb_tree().nearest(target.v, True)
+def setup_deformation_transfer(source, target):
+    # Get closest points on mesh and trilist indices
+    vtk_mesh = trimesh_to_vtk(source)
+    closest_pts_on_mesh = VTKClosestPointLocator(vtk_mesh)
+    nearest_pts, _ = closest_pts_on_mesh(target.points)
+
+    bcs, bc_idxs = source.barycentric_coordinates_of_pointcloud(PointCloud(nearest_pts))
+
+    # Make sparse colummn matrix to hold upsampling values
+    rows = np.floor(np.arange(0, target.points.shape[0], 1.0/3.0)).ravel()
+    cols = source.trilist[bc_idxs].ravel()
+    coeffs_v = bcs.ravel()
+
+    matrix = sp.csc_matrix((coeffs_v, (rows, cols)), shape=(target.points.shape[0], source.points.shape[0]))
+    return matrix
+
+
+def setup_deformation_transfer_orig(source, target, use_normals=False):
+    rows = np.zeros(3 * target.points.shape[0])
+    cols = np.zeros(3 * target.points.shape[0])
+    coeffs_v = np.zeros(3 * target.points.shape[0])
+    coeffs_n = np.zeros(3 * target.points.shape[0])
+
+    nearest_faces, nearest_parts, nearest_vertices = source.compute_aabb_tree().nearest(target.points, True)
     nearest_faces = nearest_faces.ravel().astype(np.int64)
     nearest_parts = nearest_parts.ravel().astype(np.int64)
     nearest_vertices = nearest_vertices.ravel()
 
-    for i in range(target.v.shape[0]):
+    for i in range(target.points.shape[0]):
         # Closest triangle index
         f_id = nearest_faces[i]
         # Closest triangle vertex ids
-        nearest_f = source.f[f_id]
+        nearest_f = source.trilist[f_id]
 
         # Closest surface point
         nearest_v = nearest_vertices[3 * i:3 * i + 3]
         # Distance vector to the closest surface point
-        dist_vec = target.v[i] - nearest_v
+        # dist_vec = target.points[i] - nearest_v
 
         rows[3 * i:3 * i + 3] = i * np.ones(3)
         cols[3 * i:3 * i + 3] = nearest_f
@@ -62,26 +83,19 @@ def setup_deformation_transfer(source, target, use_normals=False):
         n_id = nearest_parts[i]
         if n_id == 0:
             # Closest surface point in triangle
-            A = np.vstack((source.v[nearest_f])).T
+            A = np.vstack((source.points[nearest_f])).T
             coeffs_v[3 * i:3 * i + 3] = np.linalg.lstsq(A, nearest_v)[0]
-        elif n_id > 0 and n_id <= 3:
+        elif 0 < n_id <= 3:
             # Closest surface point on edge
-            A = np.vstack((source.v[nearest_f[n_id - 1]], source.v[nearest_f[n_id % 3]])).T
-            tmp_coeffs = np.linalg.lstsq(A, target.v[i])[0]
+            A = np.vstack((source.points[nearest_f[n_id - 1]], source.points[nearest_f[n_id % 3]])).T
+            tmp_coeffs = np.linalg.lstsq(A, target.points[i])[0]
             coeffs_v[3 * i + n_id - 1] = tmp_coeffs[0]
             coeffs_v[3 * i + n_id % 3] = tmp_coeffs[1]
         else:
             # Closest surface point a vertex
             coeffs_v[3 * i + n_id - 4] = 1.0
 
-    #    if use_normals:
-    #        A = np.vstack((vn[nearest_f])).T
-    #        coeffs_n[3 * i:3 * i + 3] = np.linalg.lstsq(A, dist_vec)[0]
-
-    #coeffs = np.hstack((coeffs_v, coeffs_n))
-    #rows = np.hstack((rows, rows))
-    #cols = np.hstack((cols, source.v.shape[0] + cols))
-    matrix = sp.csc_matrix((coeffs_v, (rows, cols)), shape=(target.v.shape[0], source.v.shape[0]))
+    matrix = sp.csc_matrix((coeffs_v, (rows, cols)), shape=(target.points.shape[0], source.points.shape[0]))
     return matrix
 
 
@@ -90,6 +104,7 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
 
     A Qslim-style approach is used here.
 
+    :param mesh: mesh to be simplified
     :param factor: fraction of the original vertices to retain
     :param n_verts_desired: number of the original vertices to retain
     :returns: new_faces: An Fx3 array of faces, mtx: Transformation matrix
@@ -99,18 +114,19 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
         raise Exception('Need either factor or n_verts_desired.')
 
     if n_verts_desired is None:
-        n_verts_desired = math.ceil(len(mesh.v) * factor)
+        n_verts_desired = math.ceil(len(mesh.points) * factor)
 
     Qv = vertex_quadrics(mesh)
 
     # fill out a sparse matrix indicating vertex-vertex adjacency
     # from psbody.mesh.topology.connectivity import get_vertices_per_edge
-    vert_adj = get_vertices_per_edge(mesh.v, mesh.f)
-    # vert_adj = sp.lil_matrix((len(mesh.v), len(mesh.v)))
-    # for f_idx in range(len(mesh.f)):
-    #     vert_adj[mesh.f[f_idx], mesh.f[f_idx]] = 1
+    vert_adj = get_vertices_per_edge(mesh.points, mesh.trilist)
+    # vert_adj = sp.lil_matrix((len(mesh.points), len(mesh.points)))
+    # for f_idx in range(len(mesh.trilist)):
+    #     vert_adj[mesh.trilist[f_idx], mesh.trilist[f_idx]] = 1
 
-    vert_adj = sp.csc_matrix((vert_adj[:, 0] * 0 + 1, (vert_adj[:, 0], vert_adj[:, 1])), shape=(len(mesh.v), len(mesh.v)))
+    vert_adj = sp.csc_matrix((vert_adj[:, 0] * 0 + 1, (vert_adj[:, 0], vert_adj[:, 1])),
+                             shape=(len(mesh.points), len(mesh.points)))
     vert_adj = vert_adj + vert_adj.T
     vert_adj = vert_adj.tocoo()
 
@@ -137,13 +153,13 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
         if r > c:
             continue
 
-        cost = collapse_cost(Qv, r, c, mesh.v)['collapse_cost']
+        cost = collapse_cost(Qv, r, c, mesh.points)['collapse_cost']
         heapq.heappush(queue, (cost, (r, c)))
 
     # decimate
     collapse_list = []
-    nverts_total = len(mesh.v)
-    faces = mesh.f.copy()
+    nverts_total = len(mesh.points)
+    faces = mesh.trilist.copy()
     while nverts_total > n_verts_desired:
         e = heapq.heappop(queue)
         r = e[1][0]
@@ -151,7 +167,7 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
         if r == c:
             continue
 
-        cost = collapse_cost(Qv, r, c, mesh.v)
+        cost = collapse_cost(Qv, r, c, mesh.points)
         if cost['collapse_cost'] > e[0]:
             heapq.heappush(queue, (cost['collapse_cost'], e[1]))
             # print 'found outdated cost, %.2f < %.2f' % (e[0], cost['collapse_cost'])
@@ -196,7 +212,7 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
 
         nverts_total = (len(np.unique(faces.flatten())))
 
-    new_faces, mtx = _get_sparse_transform(faces, len(mesh.v))
+    new_faces, mtx = _get_sparse_transform(faces, len(mesh.points))
     return new_faces, mtx
 
 
@@ -211,9 +227,10 @@ def _get_sparse_transform(faces, num_original_verts):
     new_faces = mp[faces.copy().flatten()].reshape((-1, 3))
 
     ij = np.vstack((IS.flatten(), JS.flatten()))
-    mtx = sp.csc_matrix((data, ij), shape=(len(verts_left) , num_original_verts ))
+    mtx = sp.csc_matrix((data, ij), shape=(len(verts_left), num_original_verts))
 
-    return (new_faces, mtx)
+    return new_faces, mtx
+
 
 def generate_transform_matrices(mesh, factors):
     """Generates len(factors) meshes, each of them is scaled by factors[i] and
@@ -225,19 +242,18 @@ def generate_transform_matrices(mesh, factors):
        D: Downsampling transforms between each of the meshes
        U: Upsampling transforms between each of the meshes
     """
-
     factors = map(lambda x: 1.0/x, factors)
-    M,A,D,U = [], [], [], []
-    A.append(get_vert_connectivity(mesh.v, mesh.f))
+    M, A, D, U = [], [], [], []
+    A.append(get_vert_connectivity(mesh.points, mesh.trilist))
     M.append(mesh)
 
     for factor in factors:
         ds_f, ds_D = qslim_decimator_transformer(M[-1], factor=factor)
         D.append(ds_D)
-        new_mesh_v = ds_D.dot(M[-1].v)
-        new_mesh = Mesh(v=new_mesh_v,f=ds_f)
+        new_mesh_v = ds_D.dot(M[-1].points)
+        new_mesh = TriMesh(points=new_mesh_v, trilist=ds_f)
         M.append(new_mesh)
-        A.append(get_vert_connectivity(new_mesh.v, new_mesh.f))
+        A.append(get_vert_connectivity(new_mesh.points, new_mesh.trilist))
         U.append(setup_deformation_transfer(M[-1], M[-2]))
 
-    return M,A,D,U
+    return M, A, D, U
