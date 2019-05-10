@@ -1,25 +1,25 @@
 from __future__ import print_function
 
-from facemesh import FaceData
-from lib import graph, mesh_sampling, models
-# from lib.visualize_latent_space import visualize_latent_space
-# from opendr.topology import get_vert_connectivity
-
 import argparse
 import copy
 import json
 import os
-import time
+
+from facemesh import FaceData
+from lib import graph, mesh_sampling, models
+from lib.visualize_latent_space import visualize_latent_space
 
 import numpy as np
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 
 parser = argparse.ArgumentParser(description='Tensorflow Trainer for Convolutional Mesh Autoencoders')
-parser.add_argument('--name', default='bareteeth', help='facial_motion| lfw ')
+parser.add_argument('--name', default='bareteeth_test', help='facial_motion| lfw ')
 parser.add_argument('--data', default='data/bareteeth', help='facial_motion| lfw ')
 parser.add_argument('--batch_size', type=int, default=16, help='input batch size for training (default: 64)')
-parser.add_argument('--num_epochs', type=int, default=200, help='number of epochs to train (default: 2)')
-parser.add_argument('--eval_frequency', type=int, default=50, help='eval frequency')
+parser.add_argument('--num_epochs', type=int, default=30000, help='number of epochs to train (default: 2)')
+parser.add_argument('--eval_frequency', type=int, default=10000, help='eval frequency')
 parser.add_argument('--filter', default='chebyshev5', help='filter')
 parser.add_argument('--nz', type=int, default=8, help='Size of latent variable')
 parser.add_argument('--lr', type=float, default=8e-3, help='Learning Rate')
@@ -37,8 +37,15 @@ args = parser.parse_args()
 
 np.random.seed(args.seed)
 nz = args.nz
-print("Loading data...")
-reference_mesh_file = 'data/template.obj'
+
+print("Loading data for {} at path {}...".format(args.name, args.data))
+
+if args.name == 'ear' or args.name == 'ears':
+    reference_mesh_file = 'data/r_ear.obj'
+else:
+    reference_mesh_file = 'data/template.obj'
+
+print('Reference mesh: {}'.format(reference_mesh_file))
 facedata = FaceData(nVal=100, train_file=args.data+'/train.npy', test_file=args.data+'/test.npy',
                     reference_mesh_file=reference_mesh_file, pca_n_comp=nz)
 
@@ -62,8 +69,10 @@ p = list(map(lambda x: x.shape[0], A))
 X_train = facedata.vertices_train.astype('float32')
 X_val = facedata.vertices_val.astype('float32')
 X_test = facedata.vertices_test.astype('float32')
+print('Train data: {}, Test data: {}, Validation data: {}'.format(
+    X_train.shape, X_test.shape, X_val.shape))
 
-print("Computing Graph Laplacians ..")
+print("Computing Graph Laplacians...")
 L = [graph.laplacian(a, normalized=True) for a in A]
 
 n_train = X_train.shape[0]
@@ -77,7 +86,6 @@ params['filter']         = args.filter
 params['brelu']          = 'b1relu'
 params['pool']           = 'poolwT'
 params['unpool']		 = 'poolwT'
-
 
 # Architecture.
 params['F_0']            = int(X_train.shape[2])  # Number of graph input features.
@@ -98,36 +106,37 @@ params['decay_steps']    = n_train / params['batch_size']
 
 model = models.coma(L=L, D=D, U=U, **params)
 
-# if args.mode in ['test']:
-#     print('Starting testing...')
-#     if not os.path.exists('results'):
-#         os.makedirs('results')
-#     predictions, loss = model.predict(X_test, X_test)
-#     print("L1 Loss= ", loss)
-#     euclidean_loss = np.mean(np.sqrt(np.sum((facedata.std*(predictions-facedata.vertices_test))**2, axis=2)))
-#     print("Euclidean loss= ", euclidean_loss)
-#     np.save('results/'+args.name+'_predictions', predictions)
-#
-#     # if args.viz:
-#     #     from psbody.mesh import MeshViewers
-#     #     viewer_recon = MeshViewers(window_width=800, window_height=1000, shape=[5,4], titlebar='Mesh Reconstructions')
-#     #     for i in range(predictions.shape[0]/20):
-#     #         facedata.show_mesh(viewer=viewer_recon, mesh_vecs=predictions_unperm[i*20:(i+1)*20], figsize=(5,4))
-#     #         time.sleep(0.1)
-#
-# elif args.mode in ['sample']:
-#     print('Sampling meshes...')
-#     meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
-#     features = model.encode(meshes)
-# elif args.mode in ['latent']:
-#     print('Latent mode visualisation temporarily deactivated.')
-#     # visualize_latent_space(model, facedata)
-# else:
-#     print('Starting training...')
-#     if not os.path.exists(os.path.join('checkpoints', args.name)):
-#         os.makedirs(os.path.join('checkpoints', args.name))
-#     with open(os.path.join('checkpoints', args.name + 'params.json'), 'w') as fp:
-#         saveparams = copy.deepcopy(params)
-#         saveparams['seed'] = args.seed
-#         json.dump(saveparams, fp)
-#         loss, t_step = model.fit(X_train, X_train, X_val, X_val)
+if args.mode in ['mock']:
+    pass
+elif args.mode in ['test']:
+    print('Starting testing...')
+    if not os.path.exists('results'):
+        os.makedirs('results')
+    predictions, loss = model.predict(X_test, X_test)
+    print("L1 Loss= ", loss)
+    euclidean_loss = np.mean(np.sqrt(np.sum((facedata.std*(predictions-facedata.vertices_test))**2, axis=2)))
+    print("Euclidean loss= ", euclidean_loss)
+    np.save('results/'+args.name+'_predictions', predictions)
+
+    # if args.viz:
+    #     from psbody.mesh import MeshViewers
+    #     viewer_recon = MeshViewers(window_width=800, window_height=1000, shape=[5,4], titlebar='Mesh Reconstructions')
+    #     for i in range(predictions.shape[0]/20):
+    #         facedata.show_mesh(viewer=viewer_recon, mesh_vecs=predictions_unperm[i*20:(i+1)*20], figsize=(5,4))
+    #         time.sleep(0.1)
+elif args.mode in ['sample']:
+    print('Sampling meshes...')
+    meshes = facedata.get_normalized_meshes(args.mesh1, args.mesh2)
+    features = model.encode(meshes)
+elif args.mode in ['latent']:
+    print('Latent mode visualisation...')
+    visualize_latent_space(model, facedata)
+else:
+    print('Starting training...')
+    if not os.path.exists(os.path.join('checkpoints', args.name)):
+        os.makedirs(os.path.join('checkpoints', args.name))
+    with open(os.path.join('checkpoints', args.name + 'params.json'), 'w') as fp:
+        saveparams = copy.deepcopy(params)
+        saveparams['seed'] = args.seed
+        json.dump(saveparams, fp)
+        loss, t_step = model.fit(X_train, X_train, X_val, X_val)

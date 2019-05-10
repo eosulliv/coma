@@ -61,13 +61,14 @@ if not os.path.exists(opt.save):
 	os.makedirs(opt.save+'/plt')
 
 reference_mesh_file = 'data/template.obj'
-facedata = FaceData(nVal=100, train_file=opt.data+'/train.npy',
-	test_file=opt.data+'/test.npy', reference_mesh_file=reference_mesh_file, pca_n_comp=opt.nz, fitpca=True)
+facedata = FaceData(nVal=100, train_file=opt.data+'/train.npy', test_file=opt.data+'/test.npy',
+					reference_mesh_file=reference_mesh_file, pca_n_comp=opt.nz, fitpca=True)
 nv = facedata.n_vertex*3
 nTest = facedata.vertices_test.shape[0]
 
 cnn_outputs = np.load(opt.cnn)
-pca_outputs = facedata.pca.inverse_transform(facedata.pca.transform(np.reshape(facedata.vertices_test, (facedata.vertices_test.shape[0], facedata.n_vertex*3))))
+pca_outputs = facedata.pca.inverse_transform(
+	facedata.pca.transform(np.reshape(facedata.vertices_test, (facedata.vertices_test.shape[0], facedata.n_vertex*3))))
 
 cnn_vertices = (cnn_outputs * facedata.std) + facedata.mean
 pca_vertices = (np.reshape(pca_outputs, (pca_outputs.shape[0], facedata.n_vertex, 3)) * facedata.std) + facedata.mean

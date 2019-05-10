@@ -217,7 +217,7 @@ class base_model(object):
                 tmp_data = tmp_data.toarray()  # convert sparse matrices
             batch_data[:end-begin] = tmp_data
             feed_dict = {self.ph_z: batch_data, self.ph_dropout: 1}
-            
+
             batch_pred = sess.run(self.op_decoder, feed_dict)
             
             x_rec[begin:end] = batch_pred[:end-begin]
@@ -342,6 +342,238 @@ class base_model(object):
     def _conv2d(self, x, W):
         return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')
 
+
+# Convlutional Mesh Autoencoder
+
+
+class coma(base_model):
+    """
+    Mesh Convolutional Autoencoder which uses the Chebyshev approximation.
+
+    The following are hyper-parameters of graph convolutional layers.
+    They are lists, which length is equal to the number of gconv layers.
+        F: Number of features.
+        K: List of polynomial orders, i.e. filter sizes or number of hopes.
+        p: Pooling size.
+           Should be 1 (no pooling) or a power of 2 (reduction by 2 at each coarser level).
+           Beware to have coarsened enough.
+
+    L: List of Graph Laplacians. Size M x M. One per coarsening level.
+
+    The following are hyper-parameters of fully connected layers.
+    They are lists, which length is equal to the number of fc layers.
+        M: Number of features per sample, i.e. number of hidden neurons.
+           The last layer is the softmax, i.e. M[-1] is the number of classes.
+    
+    The following are choices of implementation for various blocks.
+        filter: filtering operation, e.g. chebyshev5, lanczos2 etc.
+        brelu: bias and relu, e.g. b1relu or b2relu.
+        pool: pooling, e.g. mpool1.
+    
+    Training parameters:
+        num_epochs:    Number of training epochs.
+        learning_rate: Initial learning rate.
+        decay_rate:    Base of exponential decay. No decay with 1.
+        decay_steps:   Number of steps after which the learning rate decays.
+        momentum:      Momentum. 0 indicates no momentum.
+
+    Regularization parameters:
+        regularization: L2 regularizations of weights and biases.
+        dropout:        Dropout (fc layers): probability to keep hidden neurons. No dropout with 1.
+        batch_size:     Batch size. Must divide evenly into the dataset sizes.
+        eval_frequency: Number of steps between evaluations.
+
+    Directories:
+        dir_name: Name for directories (summaries and model parameters).
+    """
+    def __init__(self, L, D, U, F, K, p, nz, nv, which_loss, F_0=1, filter='chebyshev5', brelu='b1relu', pool='mpool1',
+                 unpool='poolwT', num_epochs=20, learning_rate=0.1, decay_rate=0.95, decay_steps=None, momentum=0.9,
+                 regularization=0, dropout=0, batch_size=100, eval_frequency=200,
+                 dir_name=''):
+        super(coma, self).__init__()
+
+        # Keep the useful Laplacians only. May be zero.
+        M_0 = L[0].shape[0]
+
+        # Print information about NN architecture.
+        Ngconv = len(p)
+        Nfc = len(nz)
+        print('NN architecture')
+        # Store attributes and bind operations.
+        self.L, self.D, self.U, self.F, self.K, self.p, self.nz, self.F_0 = L, D, U, F, K, p, nz, F_0
+        self.which_loss = which_loss
+        self.num_epochs, self.learning_rate = num_epochs, learning_rate
+        self.decay_rate, self.decay_steps, self.momentum = decay_rate, decay_steps, momentum
+        self.regularization, self.dropout = regularization, dropout
+        self.batch_size, self.eval_frequency = batch_size, eval_frequency
+        self.dir_name = dir_name
+        self.filter = getattr(self, filter)
+        self.brelu = getattr(self, brelu)
+        self.pool = getattr(self, pool)
+        self.unpool = getattr(self, unpool)
+        
+        # self.loss_weights = weight_tensor
+        # Build the computational graph.
+        self.build_graph(M_0, F_0)
+        
+    def loss(self, outputs, labels, regularization):
+        """Adds to the inference model the layers required to generate loss."""
+        with tf.name_scope('loss'):
+            with tf.name_scope('data_loss'):
+                if self.which_loss == "l1":
+                    data_loss = tf.losses.absolute_difference(predictions=outputs, labels=labels,
+                                                              reduction=tf.losses.Reduction.MEAN)
+                else:
+                    data_loss = tf.losses.mean_squared_error(predictions=outputs, labels=labels,
+                                                             reduction=tf.losses.Reduction.MEAN)
+                # cross_entropy = tf.reduce_mean(cross_entropy)
+
+            with tf.name_scope('regularization'):
+                print('Regularisers: {}, Regularisation: {}'.format(self.regularizers, regularization))
+                regularization *= tf.add_n(self.regularizers)
+            loss = data_loss + regularization
+            
+            # print(loss, l2_loss, regularization)
+            # Summaries for TensorBoard.
+            tf.summary.scalar('loss/data_loss', data_loss)
+            tf.summary.scalar('loss/regularization', regularization)
+            tf.summary.scalar('loss/total', loss)
+            with tf.name_scope('averages'):
+                averages = tf.train.ExponentialMovingAverage(0.9)
+                op_averages = averages.apply([data_loss, regularization, loss])
+                tf.summary.scalar('loss/avg/data_loss', averages.average(data_loss))
+                tf.summary.scalar('loss/avg/regularization', averages.average(regularization))
+                tf.summary.scalar('loss/avg/total', averages.average(loss))
+                with tf.control_dependencies([op_averages]):
+                    loss_average = tf.identity(averages.average(loss), name='control')
+            return loss, loss_average
+
+    def chebyshev5(self, x, L, Fout, K):
+        N, M, Fin = x.get_shape()
+        N, M, Fin = int(N), int(M), int(Fin)
+        # Rescale Laplacian and store as a TF sparse tensor. Copy to not modify the shared L.
+        L = scipy.sparse.csr_matrix(L)
+        L = graph.rescale_L(L, lmax=2)
+        L = L.tocoo()
+        indices = np.column_stack((L.row, L.col))
+        L = tf.SparseTensor(indices, L.data, L.shape)
+        L = tf.sparse_reorder(L)
+        # Transform to Chebyshev basis
+        x0 = tf.transpose(x, perm=[1, 2, 0])  # M x Fin x N
+        x0 = tf.reshape(x0, [M, Fin*N])  # M x Fin*N
+        x = tf.expand_dims(x0, 0)  # 1 x M x Fin*N
+
+        def concat(x, x_):
+            x_ = tf.expand_dims(x_, 0)  # 1 x M x Fin*N
+            return tf.concat([x, x_], axis=0)  # K x M x Fin*N
+
+        if K > 1:
+            x1 = tf.sparse_tensor_dense_matmul(L, x0)
+            x = concat(x, x1)
+
+        for k in range(2, K):
+            x2 = 2 * tf.sparse_tensor_dense_matmul(L, x1) - x0  # M x Fin*N
+            x = concat(x, x2)
+            x0, x1 = x1, x2
+
+        x = tf.reshape(x, [K, M, Fin, N])  # K x M x Fin x N
+        x = tf.transpose(x, perm=[3, 1, 2, 0])  # N x M x Fin x K
+        x = tf.reshape(x, [N*M, Fin*K])  # N*M x Fin*K
+        # Filter: Fin*Fout filters of order K, i.e. one filterbank per feature pair.
+        W = self._weight_variable([Fin*K, Fout], regularization=False)
+        x = tf.matmul(x, W)  # N*M x Fout
+        return tf.reshape(x, [N, M, Fout])  # N x M x Fout
+
+    def b1relu(self, x):
+        """Bias and ReLU. One bias per filter."""
+        N, M, F = x.get_shape()
+        b = self._bias_variable([1, 1, int(F)], regularization=False)
+        return tf.nn.relu(x + b)
+
+    def b2relu(self, x):
+        """Bias and ReLU. One bias per vertex per filter."""
+        N, M, F = x.get_shape()
+        b = self._bias_variable([1, int(M), int(F)], regularization=False)
+        return tf.nn.relu(x + b)
+
+    def poolwT(self, x, L):
+        Mp = L.shape[0]
+        N, M, Fin = x.get_shape()
+        N, M, Fin = int(N), int(M), int(Fin)
+        # Rescale transform Matrix L and store as a TF sparse tensor. Copy to not modify the shared L.
+        L = scipy.sparse.csr_matrix(L)
+        L = L.tocoo()
+        indices = np.column_stack((L.row, L.col))
+        L = tf.SparseTensor(indices, L.data, L.shape)
+        L = tf.sparse_reorder(L)
+
+        x = tf.transpose(x, perm=[1, 2, 0])  # M x Fin x N
+        x = tf.reshape(x, [M, Fin*N])  # M x Fin*N
+        x = tf.sparse_tensor_dense_matmul(L, x)  # Mp x Fin*N
+        x = tf.reshape(x, [Mp, Fin, N])  # Mp x Fin x N
+        x = tf.transpose(x, perm=[2, 0, 1])  # N x Mp x Fin
+
+        return x
+
+    def fc(self, x, Mout, relu=True):
+        """Fully connected layer with Mout features."""
+        N, Min = x.get_shape()
+        W = self._weight_variable([int(Min), Mout], regularization=True)
+        b = self._bias_variable([Mout], regularization=True)
+        x = tf.matmul(x, W) + b
+        return tf.nn.relu(x) if relu else x
+
+    def _encode(self, x, reuse=False):
+        with tf.variable_scope('encoder', reuse=reuse):
+            N, Min, Fin = x.get_shape()
+            for i in range(len(self.F)):
+                with tf.variable_scope('conv{}'.format(i+1)):
+                    with tf.name_scope('filter'):
+                        x = self.filter(x, self.L[i], self.F[i], self.K[i])
+                        # print(self.L[i], self.F[i], self.K[i])
+                    with tf.name_scope('bias_relu'):
+                        x = self.brelu(x)
+                    with tf.name_scope('pooling'):
+                        x = self.pool(x, self.D[i])
+        
+            # Fully connected hidden layers.
+            x = tf.reshape(x, [int(N), int(self.p[-1]*self.F[-1])])  # N x MF
+            if self.nz:
+                with tf.variable_scope('fc'):
+                    x = self.fc(x, int(self.nz[0]))    # N x M0
+        return x
+
+    def _decode(self, x, reuse=False):
+        with tf.variable_scope('decoder', reuse=reuse):
+            N = x.get_shape()[0]
+            # M, F, Fin = self.D[-1].shape[0], self.F[-1], self.F_0
+            with tf.variable_scope('fc2'):
+                x = self.fc(x, int(self.p[-1]*self.F[-1]))  # N x MF
+
+            x = tf.reshape(x, [int(N), int(self.p[-1]), int(self.F[-1])])  # N x M x F
+
+            for i in range(len(self.F)):
+                with tf.variable_scope('upconv{}'.format(i+1)):
+                    with tf.name_scope('unpooling'):
+                        x = self.unpool(x, self.U[-i-1])
+                    with tf.name_scope('filter'):
+                        x = self.filter(x, self.L[len(self.F)-i-1], self.F[-i-1], self.K[-i-1])
+                        # print(self.L[-(i+1)], self.F[-(i+1)], self.K[-(i+1)])
+                    with tf.name_scope('bias_relu'):
+                        x = self.brelu(x)
+
+            with tf.name_scope('outputs'):
+                x = self.filter(x, self.L[0], int(self.F_0), self.K[0])
+
+        return x
+
+    def _inference(self, x, dropout):
+        z = self._encode(x)
+        x = self._decode(z)
+
+        return x
+
+
 # Fully connected
 
 
@@ -428,7 +660,7 @@ class fcnn2(base_model):
             y = tf.reshape(y_2d, [-1, self.F, NFEATURES])
             # Bias and non-linearity
             b = self._bias_variable([1, self.F, 1])
-#            b = self._bias_variable([1, self.F, NFEATURES])
+            # b = self._bias_variable([1, self.F, NFEATURES])
             y += b  # NSAMPLES x NFILTERS x NFEATURES
             y = tf.nn.relu(y)
         with tf.name_scope('fc1'):
@@ -468,7 +700,7 @@ class fgcnn2(base_model):
             y = tf.reshape(yf, [-1, self.F, NFEATURES])
             # Bias and non-linearity
             b = self._bias_variable([1, self.F, 1])
-#            b = self._bias_variable([1, self.F, NFEATURES])
+            # b = self._bias_variable([1, self.F, NFEATURES])
             y += b  # NSAMPLES x NFILTERS x NFEATURES
             y = tf.nn.relu(y)
         with tf.name_scope('fc1'):
@@ -499,7 +731,7 @@ class lgcnn2_1(base_model):
             y = tf.reshape(y, [-1, M, self.F])  # N x M x F
             # Bias and non-linearity
             b = self._bias_variable([1, 1, self.F])
-#            b = self._bias_variable([1, M, self.F])
+            # b = self._bias_variable([1, M, self.F])
             y += b  # N x M x F
             y = tf.nn.relu(y)
         with tf.name_scope('fc1'):
@@ -535,7 +767,7 @@ class lgcnn2_2(base_model):
             y = tf.matmul(xl, W)  # NM x F
             y = tf.reshape(y, [-1, M, self.F])  # N x M x F
             # Bias and non-linearity
-#            b = self._bias_variable([1, 1, self.F])
+            # b = self._bias_variable([1, 1, self.F])
             b = self._bias_variable([1, M, self.F])
             y += b  # N x M x F
             y = tf.nn.relu(y)
@@ -573,7 +805,7 @@ class cgcnn2_2(base_model):
             y = tf.matmul(xc, W)  # NM x F
             y = tf.reshape(y, [-1, M, self.F])  # N x M x F
             # Bias and non-linearity
-#            b = self._bias_variable([1, 1, self.F])
+            # b = self._bias_variable([1, 1, self.F])
             b = self._bias_variable([1, M, self.F])
             y += b  # N x M x F
             y = tf.nn.relu(y)
@@ -672,7 +904,7 @@ class cgcnn2_4(base_model):
                 y += filter(xt2, k)
                 xt0, xt1 = xt1, xt2
             # Bias and non-linearity
-#            b = self._bias_variable([1, 1, self.F])
+            # b = self._bias_variable([1, 1, self.F])
             b = self._bias_variable([1, M, self.F])
             y += b  # N x M x F
             y = tf.nn.relu(y)
@@ -727,7 +959,7 @@ class cgcnn2_5(base_model):
             y = tf.matmul(xt, W)  # NM x F
             y = tf.reshape(y, [-1, M, self.F])  # N x M x F
             # Bias and non-linearity
-#            b = self._bias_variable([1, 1, self.F])
+            # b = self._bias_variable([1, 1, self.F])
             b = self._bias_variable([1, M, self.F])
             y += b  # N x M x F
             y = tf.nn.relu(y)
@@ -779,7 +1011,6 @@ def bspline_basis(K, x, degree=3):
     basis = np.column_stack([cox_deboor(k, degree) for k in range(K)])
     basis[-1, -1] = 1
     return basis
-
 
 # class cgcnn(base_model):
 #     """
@@ -1088,229 +1319,3 @@ def bspline_basis(K, x, degree=3):
 #         # with tf.variable_scope('logits'):
 #         #    x = self.fc(x, self.M[-1], relu=False)
 #         return x
-#
-
-class coma(base_model):
-    """
-    Mesh Convolutional Autoencoder which uses the Chebyshev approximation.
-
-    The following are hyper-parameters of graph convolutional layers.
-    They are lists, which length is equal to the number of gconv layers.
-        F: Number of features.
-        K: List of polynomial orders, i.e. filter sizes or number of hopes.
-        p: Pooling size.
-           Should be 1 (no pooling) or a power of 2 (reduction by 2 at each coarser level).
-           Beware to have coarsened enough.
-
-    L: List of Graph Laplacians. Size M x M. One per coarsening level.
-
-    The following are hyper-parameters of fully connected layers.
-    They are lists, which length is equal to the number of fc layers.
-        M: Number of features per sample, i.e. number of hidden neurons.
-           The last layer is the softmax, i.e. M[-1] is the number of classes.
-    
-    The following are choices of implementation for various blocks.
-        filter: filtering operation, e.g. chebyshev5, lanczos2 etc.
-        brelu: bias and relu, e.g. b1relu or b2relu.
-        pool: pooling, e.g. mpool1.
-    
-    Training parameters:
-        num_epochs:    Number of training epochs.
-        learning_rate: Initial learning rate.
-        decay_rate:    Base of exponential decay. No decay with 1.
-        decay_steps:   Number of steps after which the learning rate decays.
-        momentum:      Momentum. 0 indicates no momentum.
-
-    Regularization parameters:
-        regularization: L2 regularizations of weights and biases.
-        dropout:        Dropout (fc layers): probability to keep hidden neurons. No dropout with 1.
-        batch_size:     Batch size. Must divide evenly into the dataset sizes.
-        eval_frequency: Number of steps between evaluations.
-
-    Directories:
-        dir_name: Name for directories (summaries and model parameters).
-    """
-    def __init__(self, L, D, U, F, K, p, nz, nv, which_loss, F_0=1, filter='chebyshev5', brelu='b1relu', pool='mpool1',
-                 unpool='poolwT', num_epochs=20, learning_rate=0.1, decay_rate=0.95, decay_steps=None, momentum=0.9,
-                 regularization=0, dropout=0, batch_size=100, eval_frequency=200,
-                 dir_name=''):
-        super(coma, self).__init__()
-
-        # Keep the useful Laplacians only. May be zero.
-        M_0 = L[0].shape[0]
-
-        # Print information about NN architecture.
-        Ngconv = len(p)
-        Nfc = len(nz)
-        print('NN architecture')
-        # Store attributes and bind operations.
-        self.L, self.D, self.U, self.F, self.K, self.p, self.nz, self.F_0 = L, D, U, F, K, p, nz, F_0
-        self.which_loss = which_loss
-        self.num_epochs, self.learning_rate = num_epochs, learning_rate
-        self.decay_rate, self.decay_steps, self.momentum = decay_rate, decay_steps, momentum
-        self.regularization, self.dropout = regularization, dropout
-        self.batch_size, self.eval_frequency = batch_size, eval_frequency
-        self.dir_name = dir_name
-        self.filter = getattr(self, filter)
-        self.brelu = getattr(self, brelu)
-        self.pool = getattr(self, pool)
-        self.unpool = getattr(self, unpool)
-        
-        # self.loss_weights = weight_tensor
-        # Build the computational graph.
-        self.build_graph(M_0, F_0)
-        
-    def loss(self, outputs, labels, regularization):
-        """Adds to the inference model the layers required to generate loss."""
-        with tf.name_scope('loss'):
-            with tf.name_scope('data_loss'):
-                if self.which_loss == "l1":
-                    data_loss = tf.losses.absolute_difference(predictions=outputs, labels=labels,
-                                                              reduction=tf.losses.Reduction.MEAN)
-                else:
-                    data_loss = tf.losses.mean_squared_error(predictions=outputs, labels=labels,
-                                                             reduction=tf.losses.Reduction.MEAN)
-                # cross_entropy = tf.reduce_mean(cross_entropy)
-            with tf.name_scope('regularization'):
-                regularization *= tf.add_n(self.regularizers)
-            loss = data_loss + regularization
-            
-            # print(loss, l2_loss, regularization)
-            # Summaries for TensorBoard.
-            tf.summary.scalar('loss/data_loss', data_loss)
-            tf.summary.scalar('loss/regularization', regularization)
-            tf.summary.scalar('loss/total', loss)
-            with tf.name_scope('averages'):
-                averages = tf.train.ExponentialMovingAverage(0.9)
-                op_averages = averages.apply([data_loss, regularization, loss])
-                tf.summary.scalar('loss/avg/data_loss', averages.average(data_loss))
-                tf.summary.scalar('loss/avg/regularization', averages.average(regularization))
-                tf.summary.scalar('loss/avg/total', averages.average(loss))
-                with tf.control_dependencies([op_averages]):
-                    loss_average = tf.identity(averages.average(loss), name='control')
-            return loss, loss_average
-
-    def chebyshev5(self, x, L, Fout, K):
-        N, M, Fin = x.get_shape()
-        N, M, Fin = int(N), int(M), int(Fin)
-        # Rescale Laplacian and store as a TF sparse tensor. Copy to not modify the shared L.
-        L = scipy.sparse.csr_matrix(L)
-        L = graph.rescale_L(L, lmax=2)
-        L = L.tocoo()
-        indices = np.column_stack((L.row, L.col))
-        L = tf.SparseTensor(indices, L.data, L.shape)
-        L = tf.sparse_reorder(L)
-        # Transform to Chebyshev basis
-        x0 = tf.transpose(x, perm=[1, 2, 0])  # M x Fin x N
-        x0 = tf.reshape(x0, [M, Fin*N])  # M x Fin*N
-        x = tf.expand_dims(x0, 0)  # 1 x M x Fin*N
-
-        def concat(x, x_):
-            x_ = tf.expand_dims(x_, 0)  # 1 x M x Fin*N
-            return tf.concat([x, x_], axis=0)  # K x M x Fin*N
-
-        if K > 1:
-            x1 = tf.sparse_tensor_dense_matmul(L, x0)
-            x = concat(x, x1)
-
-        for k in range(2, K):
-            x2 = 2 * tf.sparse_tensor_dense_matmul(L, x1) - x0  # M x Fin*N
-            x = concat(x, x2)
-            x0, x1 = x1, x2
-
-        x = tf.reshape(x, [K, M, Fin, N])  # K x M x Fin x N
-        x = tf.transpose(x, perm=[3, 1, 2, 0])  # N x M x Fin x K
-        x = tf.reshape(x, [N*M, Fin*K])  # N*M x Fin*K
-        # Filter: Fin*Fout filters of order K, i.e. one filterbank per feature pair.
-        W = self._weight_variable([Fin*K, Fout], regularization=False)
-        x = tf.matmul(x, W)  # N*M x Fout
-        return tf.reshape(x, [N, M, Fout])  # N x M x Fout
-
-    def b1relu(self, x):
-        """Bias and ReLU. One bias per filter."""
-        N, M, F = x.get_shape()
-        b = self._bias_variable([1, 1, int(F)], regularization=False)
-        return tf.nn.relu(x + b)
-
-    def b2relu(self, x):
-        """Bias and ReLU. One bias per vertex per filter."""
-        N, M, F = x.get_shape()
-        b = self._bias_variable([1, int(M), int(F)], regularization=False)
-        return tf.nn.relu(x + b)
-
-    def poolwT(self, x, L):
-        Mp = L.shape[0]
-        N, M, Fin = x.get_shape()
-        N, M, Fin = int(N), int(M), int(Fin)
-        # Rescale transform Matrix L and store as a TF sparse tensor. Copy to not modify the shared L.
-        L = scipy.sparse.csr_matrix(L)
-        L = L.tocoo()
-        indices = np.column_stack((L.row, L.col))
-        L = tf.SparseTensor(indices, L.data, L.shape)
-        L = tf.sparse_reorder(L)
-
-        x = tf.transpose(x, perm=[1, 2, 0])  # M x Fin x N
-        x = tf.reshape(x, [M, Fin*N])  # M x Fin*N
-        x = tf.sparse_tensor_dense_matmul(L, x)  # Mp x Fin*N
-        x = tf.reshape(x, [Mp, Fin, N])  # Mp x Fin x N
-        x = tf.transpose(x, perm=[2, 0, 1])  # N x Mp x Fin
-
-        return x
-
-    def fc(self, x, Mout, relu=True):
-        """Fully connected layer with Mout features."""
-        N, Min = x.get_shape()
-        W = self._weight_variable([int(Min), Mout], regularization=True)
-        b = self._bias_variable([Mout], regularization=True)
-        x = tf.matmul(x, W) + b
-        return tf.nn.relu(x) if relu else x
-
-    def _encode(self, x, reuse=False):
-        with tf.variable_scope('encoder', reuse=reuse):
-            N, Min, Fin = x.get_shape()
-            for i in range(len(self.F)):
-                with tf.variable_scope('conv{}'.format(i+1)):
-                    with tf.name_scope('filter'):
-                        x = self.filter(x, self.L[i], self.F[i], self.K[i])
-                        # print(self.L[i], self.F[i], self.K[i])
-                    with tf.name_scope('bias_relu'):
-                        x = self.brelu(x)
-                    with tf.name_scope('pooling'):
-                        x = self.pool(x, self.D[i])
-        
-            # Fully connected hidden layers.
-            x = tf.reshape(x, [int(N), int(self.p[-1]*self.F[-1])])  # N x MF
-            if self.nz:
-                with tf.variable_scope('fc'):
-                    x = self.fc(x, int(self.nz[0]))    # N x M0
-        return x
-
-    def _decode(self, x, reuse=False):
-        with tf.variable_scope('decoder', reuse=reuse):
-            N = x.get_shape()[0]
-            # M, F, Fin = self.D[-1].shape[0], self.F[-1], self.F_0
-            with tf.variable_scope('fc2'):
-                x = self.fc(x, int(self.p[-1]*self.F[-1]))            # N x MF
-
-            x = tf.reshape(x, [int(N), int(self.p[-1]), int(self.F[-1])])  # N x M x F
-
-            for i in range(len(self.F)):
-                with tf.variable_scope('upconv{}'.format(i+1)):
-                    with tf.name_scope('unpooling'):
-                        x = self.unpool(x, self.U[-i-1])
-                    with tf.name_scope('filter'):
-                        x = self.filter(x, self.L[len(self.F)-i-1], self.F[-i-1], self.K[-i-1])
-                        # print(self.L[-(i+1)], self.F[-(i+1)], self.K[-(i+1)])
-                    with tf.name_scope('bias_relu'):
-                        x = self.brelu(x)
-
-            with tf.name_scope('outputs'):
-                x = self.filter(x, self.L[0], int(self.F_0), self.K[0])
-
-        return x
-
-    def _inference(self, x, dropout):
-        z = self._encode(x)
-        x = self._decode(z)
-
-        return x

@@ -1,9 +1,11 @@
 ipython
 jupyter
 matplotlib
+mayavi
 menpo
 menpo3d
 numpy
+pynput
 readchar
 scikit-learn
 scipy

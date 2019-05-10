@@ -15,11 +15,14 @@ def main():
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
-    print("Preprocessing Slice Time Data")
-    generateSlicedTimeDataSet(args.data, save_path)
+    print('Processing dataset')
+    generateDataset(args.data, save_path)
 
-    print("Preprocessing Expression Cross Validation")
-    generateExpressionDataSet(args.data, save_path)
+    # print("Preprocessing Slice Time Data")
+    # generateSlicedTimeDataSet(args.data, save_path)
+    #
+    # print("Preprocessing Expression Cross Validation")
+    # generateExpressionDataSet(args.data, save_path)
 
 
 if __name__ == '__main__':
